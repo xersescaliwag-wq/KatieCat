@@ -1,22 +1,26 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
-import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../services/auth_api.dart';
 import '../../services/auth_service.dart';
 
 enum _Mode { signIn, signUp }
 
 class AuthPage extends StatefulWidget {
-  const AuthPage({super.key});
+  const AuthPage({super.key, this.auth});
+
+  /// Auth backend to use. Defaults to [AuthService.instance]; tests inject a
+  /// fake so no network is involved.
+  final AuthApi? auth;
 
   @override
   State<AuthPage> createState() => _AuthPageState();
 }
 
 class _AuthPageState extends State<AuthPage> {
-  final _auth = AuthService.instance;
-
   final _email = TextEditingController();
   final _password = TextEditingController();
   final _confirm = TextEditingController();
@@ -29,8 +33,18 @@ class _AuthPageState extends State<AuthPage> {
   String? _message;
   bool _isError = false;
 
+  /// Seconds until another code may be requested (Supabase allows one email
+  /// per `smtp_max_frequency`, currently 60s).
+  int _resendIn = 0;
+  Timer? _resendTimer;
+
+  AuthApi get _auth => widget.auth ?? AuthService.instance;
+
+  static final _emailRe = RegExp(r'^[\w.+-]+@[\w-]+(?:\.[\w-]+)+$');
+
   @override
   void dispose() {
+    _resendTimer?.cancel();
     _email.dispose();
     _password.dispose();
     _confirm.dispose();
@@ -65,7 +79,35 @@ class _AuthPageState extends State<AuthPage> {
     }
   }
 
-  bool get _emailOk => _email.text.trim().contains('@');
+  bool get _emailOk => _emailRe.hasMatch(_email.text.trim());
+
+  bool get _otpOk => _otp.text.trim().length == AuthService.otpLength;
+
+  void _startResendCooldown([int seconds = 60]) {
+    _resendTimer?.cancel();
+    _resendIn = seconds;
+    _resendTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      setState(() {
+        if (_resendIn <= 1) {
+          _resendIn = 0;
+          t.cancel();
+        } else {
+          _resendIn--;
+        }
+      });
+    });
+  }
+
+  void _resetOtpState() {
+    _resendTimer?.cancel();
+    _resendIn = 0;
+    _otpSent = false;
+    _otp.clear();
+  }
 
   // ---------------------------------------------------------------- actions
 
@@ -75,17 +117,24 @@ class _AuthPageState extends State<AuthPage> {
 
     // ---- Registration
     if (_mode == _Mode.signUp) {
-      if (_password.text.length < 6) {
-        return _show('Password must be at least 6 characters.',
+      if (_password.text.length < AuthService.minPasswordLength) {
+        return _show(
+            'Password must be at least ${AuthService.minPasswordLength} characters.',
             error: true);
       }
       if (_password.text != _confirm.text) {
         return _show('Passwords do not match.', error: true);
       }
       final signedIn =
-      await _auth.signUp(email: email, password: _password.text);
+          await _auth.signUp(email: email, password: _password.text);
       if (!signedIn) {
-        _show('Account created. Check your email to confirm it.');
+        if (!mounted) return;
+        setState(() {
+          _password.clear();
+          _confirm.clear();
+          _mode = _Mode.signIn;
+        });
+        _show('Account created! Check your email to confirm it.');
       }
       return;
     }
@@ -102,14 +151,30 @@ class _AuthPageState extends State<AuthPage> {
     // ---- Sign in with OTP
     if (!_otpSent) {
       await _auth.sendEmailOtp(email);
+      if (!mounted) return;
       setState(() => _otpSent = true);
+      _startResendCooldown();
       _show('We sent a code to $email.');
     } else {
-      if (_otp.text.trim().length < 6) {
-        return _show('Enter the code from your email.', error: true);
+      if (!_otpOk) {
+        return _show(
+            'Enter the ${AuthService.otpLength}-digit code from your email.',
+            error: true);
       }
       await _auth.verifyEmailOtp(email: email, code: _otp.text.trim());
+      if (!mounted) return;
+      _show('Signed in!');
     }
+  });
+
+  Future<void> _resend() => _run(() async {
+    final email = _email.text.trim();
+    if (!_emailOk) return _show('Enter a valid email address.', error: true);
+    await _auth.sendEmailOtp(email);
+    if (!mounted) return;
+    setState(() {});
+    _startResendCooldown();
+    _show('We sent a new code to $email.');
   });
 
   Future<void> _forgotPassword() => _run(() async {
@@ -118,10 +183,6 @@ class _AuthPageState extends State<AuthPage> {
     }
     await _auth.sendPasswordReset(_email.text.trim());
     _show('Reset link sent. Open it on this device.');
-  });
-
-  Future<void> _apple() => _run(() async {
-    await _auth.signInWithApple();
   });
 
   // ------------------------------------------------------------------- UI
@@ -221,9 +282,9 @@ class _AuthPageState extends State<AuthPage> {
                     GlassTextField(
                       useOwnLayer: true,
                       controller: _otp,
-                      placeholder: '6-digit code',
+                      placeholder: '${AuthService.otpLength}-digit code',
                       keyboardType: TextInputType.number,
-                      maxLength: 8,
+                      maxLength: AuthService.otpLength,
                       enabled: !_loading,
                       prefixIcon: const Icon(CupertinoIcons.number,
                           size: 20, color: Color(0xB3FFFFFF)),
@@ -252,6 +313,25 @@ class _AuthPageState extends State<AuthPage> {
                     onTap: _submit,
                   ),
 
+                  if (isSignIn && _method == 1 && _otpSent) ...[
+                    const SizedBox(height: 4),
+                    CupertinoButton(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      onPressed: (_loading || _resendIn > 0) ? null : _resend,
+                      child: Text(
+                        _resendIn > 0
+                            ? 'Resend code in ${_resendIn}s'
+                            : 'Resend code',
+                        style: TextStyle(
+                          color: _resendIn > 0
+                              ? const Color(0x66FFFFFF)
+                              : CupertinoColors.white,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ],
+
                   if (isSignIn)
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
@@ -259,42 +339,39 @@ class _AuthPageState extends State<AuthPage> {
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           if (_method == 0)
-                            CupertinoButton(
-                              padding: EdgeInsets.zero,
-                              onPressed: _loading ? null : _forgotPassword,
-                              child: const Text('Forgot password?'),
+                            Flexible(
+                              child: CupertinoButton(
+                                padding: EdgeInsets.zero,
+                                onPressed: _loading ? null : _forgotPassword,
+                                child: const Text(
+                                  'Forgot password?',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
                             )
                           else
                             const SizedBox.shrink(),
-                          CupertinoButton(
-                            padding: EdgeInsets.zero,
-                            onPressed: _loading
-                                ? null
-                                : () => setState(() {
-                                      _method = _method == 0 ? 1 : 0;
-                                      _otpSent = false;
-                                      _otp.clear();
-                                      _message = null;
-                                    }),
-                            child: Text(
-                              _method == 0 ? 'Email code' : 'Use password',
+                          Flexible(
+                            child: CupertinoButton(
+                              padding: EdgeInsets.zero,
+                              onPressed: _loading
+                                  ? null
+                                  : () => setState(() {
+                                        _method = _method == 0 ? 1 : 0;
+                                        _resetOtpState();
+                                        _message = null;
+                                      }),
+                              child: Text(
+                                _method == 0 ? 'Email code' : 'Use password',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
                             ),
                           ),
                         ],
                       ),
                     ),
-
-                  const SizedBox(height: 16),
-                  const _OrDivider(),
-                  const SizedBox(height: 16),
-
-                  _GlassActionButton(
-                    label: 'Continue with Apple',
-                    icon: const FaIcon(FontAwesomeIcons.apple,
-                        size: 20, color: CupertinoColors.white),
-                    loading: false,
-                    onTap: _apple,
-                  ),
 
                   const SizedBox(height: 12),
                   CupertinoButton(
@@ -303,7 +380,7 @@ class _AuthPageState extends State<AuthPage> {
                         : () => setState(() {
                       _mode = isSignIn ? _Mode.signUp : _Mode.signIn;
                       _method = 0;
-                      _otpSent = false;
+                      _resetOtpState();
                       _message = null;
                     }),
                     child: Text(isSignIn
@@ -329,13 +406,11 @@ class _GlassActionButton extends StatelessWidget {
     required this.label,
     required this.onTap,
     this.loading = false,
-    this.icon,
   });
 
   final String label;
   final VoidCallback onTap;
   final bool loading;
-  final Widget? icon;
 
   @override
   Widget build(BuildContext context) {
@@ -350,46 +425,15 @@ class _GlassActionButton extends StatelessWidget {
         label: label,
         child: loading
             ? const CupertinoActivityIndicator(color: CupertinoColors.white)
-            : Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (icon != null) ...[icon!, const SizedBox(width: 10)],
-            Text(
-              label,
-              style: const TextStyle(
-                color: CupertinoColors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w600,
+            : Text(
+                label,
+                style: const TextStyle(
+                  color: CupertinoColors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
-            ),
-          ],
-        ),
       ),
-    );
-  }
-}
-
-class _OrDivider extends StatelessWidget {
-  const _OrDivider();
-
-  @override
-  Widget build(BuildContext context) {
-    const line = Expanded(
-      child: SizedBox(
-        height: 1,
-        child: ColoredBox(color: Color(0x33FFFFFF)),
-      ),
-    );
-    return const Row(
-      children: [
-        line,
-        Padding(
-          padding: EdgeInsets.symmetric(horizontal: 12),
-          child: Text('or',
-              style: TextStyle(color: Color(0x99FFFFFF), fontSize: 13)),
-        ),
-        line,
-      ],
     );
   }
 }

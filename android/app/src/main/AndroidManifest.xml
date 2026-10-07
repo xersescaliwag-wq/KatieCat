@@ -1,4 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required for Supabase auth / email (OTP, reset links). Debug and
+         profile manifests add this too, but release builds only read this
+         file — without it the app has no network access at all. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="katiecat"
         android:name="${applicationName}"

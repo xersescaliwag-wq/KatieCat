@@ -30,8 +30,9 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
   }
 
   Future<void> _save() async {
-    if (_password.text.length < 6) {
-      setState(() => _error = 'Password must be at least 6 characters.');
+    if (_password.text.length < AuthService.minPasswordLength) {
+      setState(() =>
+          _error = 'Password must be at least ${AuthService.minPasswordLength} characters.');
       return;
     }
     if (_password.text != _confirm.text) {
@@ -46,7 +47,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
       await AuthService.instance.updatePassword(_password.text);
       widget.onDone();
     } on AuthException catch (e) {
-      setState(() => _error = e.message);
+      if (mounted) setState(() => _error = e.message);
     } finally {
       if (mounted) setState(() => _loading = false);
     }

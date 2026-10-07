@@ -37,8 +37,6 @@ dependencies:
   liquid_glass_widgets: ^1.10.0
   font_awesome_flutter: ^11.0.0
   supabase_flutter: ^2.18.0
-  sign_in_with_apple: ^8.2.0
-  crypto: ^3.0.6
 
 dev_dependencies:
   flutter_test:

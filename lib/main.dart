@@ -19,7 +19,7 @@ Future<void> main() async {
   await LiquidGlassWidgets.initialize();
   await Supabase.initialize(
     url: supabaseUrl,
-    anonKey: supabaseAnonKey,
+    publishableKey: supabaseAnonKey,
   );
   runApp(LiquidGlassWidgets.wrap(child: const MyApp()));
 }

@@ -1,13 +1,12 @@
 import 'dart:convert';
-import 'dart:math';
 
-import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
-import 'package:sign_in_with_apple/sign_in_with_apple.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'auth_api.dart';
+
 /// Thin wrapper around Supabase auth so the UI stays clean.
-class AuthService {
+class AuthService implements AuthApi {
   AuthService._();
   static final AuthService instance = AuthService._();
 
@@ -16,8 +15,19 @@ class AuthService {
   /// Redirect URL configured in Supabase dashboard.
   static const String redirectUrl = 'com.katiecat.app://auth-callback';
 
+  /// Minimum password length enforced by this project in Supabase
+  /// (Dashboard > Auth > Settings > Password). Shorter ones are rejected
+  /// server-side, so validating here keeps the message friendly.
+  static const int minPasswordLength = 10;
+
+  /// Digits in the emailed OTP (Supabase Dashboard > Auth > Email).
+  static const int otpLength = 8;
+
+  @override
   User? get currentUser => _client.auth.currentUser;
+  @override
   Session? get currentSession => _client.auth.currentSession;
+  @override
   Stream<AuthState> get authChanges => _client.auth.onAuthStateChange;
 
   // ---------------------------------------------------------------------------
@@ -26,49 +36,141 @@ class AuthService {
 
   /// Returns true if a session was created immediately (email confirmation off),
   /// false if the user must confirm their email first.
+  @override
   Future<bool> signUp({required String email, required String password}) async {
-    final res = await _client.auth.signUp(
-      email: email,
-      password: password,
-      emailRedirectTo: redirectUrl,
-    );
-    return res.session != null;
+    try {
+      final res = await _client.auth.signUp(
+        email: email,
+        password: password,
+        emailRedirectTo: redirectUrl,
+      );
+      return res.session != null;
+    } on AuthException catch (e) {
+      if (e.statusCode == '429' || e.message.contains('rate limit')) {
+        throw const AuthException(
+          'Too many requests. Please wait a minute before trying again.',
+        );
+      }
+      if (e.message.contains('already registered') ||
+          e.message.contains('already exists') ||
+          e.statusCode == '422') {
+        throw const AuthException(
+          'This email is already registered. Please sign in instead.',
+        );
+      }
+      if (e.message.contains('disabled')) {
+        throw const AuthException(
+          'Signups are disabled. Please contact support.',
+        );
+      }
+      if (e.message.contains('password') &&
+          (e.message.contains('least') || e.message.contains('length'))) {
+        throw AuthException(
+          'Password must be at least $minPasswordLength characters.',
+        );
+      }
+      rethrow;
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Sign in with password
   // ---------------------------------------------------------------------------
 
+  @override
   Future<void> signInWithPassword({
     required String email,
     required String password,
   }) async {
-    await _client.auth.signInWithPassword(email: email, password: password);
+    try {
+      await _client.auth.signInWithPassword(email: email, password: password);
+    } on AuthException catch (e) {
+      if (e.statusCode == '400' &&
+          (e.message.contains('Invalid login credentials') ||
+              e.message.contains('invalid_credentials'))) {
+        throw const AuthException('Incorrect email or password.');
+      }
+      if (e.statusCode == '429' || e.message.contains('rate limit')) {
+        throw const AuthException(
+          'Too many sign-in attempts. Please wait a minute and try again.',
+        );
+      }
+      if (e.message.contains('Email not confirmed') ||
+          e.message.contains('email_not_confirmed')) {
+        throw const AuthException(
+          'This email is not confirmed yet. Check your inbox for the confirmation link.',
+        );
+      }
+      rethrow;
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Sign in with OTP (email code)
   // ---------------------------------------------------------------------------
 
-  /// Step 1: send a 6-digit code to the email.
+  /// Step 1: send the code to the email.
+  @override
   Future<void> sendEmailOtp(String email) async {
-    await _client.auth.signInWithOtp(
-      email: email,
-      shouldCreateUser: true,
-      emailRedirectTo: redirectUrl,
-    );
+    try {
+      await _client.auth.signInWithOtp(
+        email: email,
+        shouldCreateUser: true,
+        emailRedirectTo: redirectUrl,
+      );
+    } on AuthException catch (e) {
+      if (e.statusCode == '429' || e.message.contains('rate limit')) {
+        throw const AuthException(
+          'Too many codes requested. Please wait a minute before asking for another one.',
+        );
+      }
+      if (e.statusCode == '504' ||
+          e.message.toLowerCase().contains('timeout') ||
+          e.message.toLowerCase().contains('upstream')) {
+        throw const AuthException(
+          'The email service timed out. Please try again in a moment.',
+        );
+      }
+      if (e.statusCode == '500' ||
+          e.message.toLowerCase().contains('sending') ||
+          e.message.toLowerCase().contains('smtp')) {
+        throw const AuthException(
+          'Could not send the email right now. Please try again in a moment.',
+        );
+      }
+      rethrow;
+    }
   }
 
   /// Step 2: verify the code the user typed.
+  @override
   Future<void> verifyEmailOtp({
     required String email,
     required String code,
   }) async {
-    await _client.auth.verifyOTP(
-      email: email,
-      token: code,
-      type: OtpType.email,
-    );
+    try {
+      await _client.auth.verifyOTP(
+        email: email,
+        token: code,
+        type: OtpType.email,
+      );
+    } on AuthException catch (e) {
+      if (e.message.toLowerCase().contains('invalid') ||
+          e.message.toLowerCase().contains('expired') ||
+          e.message.toLowerCase().contains('not found') ||
+          e.statusCode == '400' ||
+          e.statusCode == '404') {
+        throw const AuthException(
+          'That code is invalid or has expired. Please request a new one.',
+        );
+      }
+      if (e.statusCode == '429' || e.message.contains('rate limit')) {
+        throw const AuthException(
+          'Too many attempts. Please wait a minute and try again.',
+        );
+      }
+      rethrow;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -77,75 +179,37 @@ class AuthService {
 
   /// Sends a reset link. Opening the link triggers
   /// [AuthChangeEvent.passwordRecovery], which the AuthGate listens for.
+  @override
   Future<void> sendPasswordReset(String email) async {
-    await _client.auth.resetPasswordForEmail(email, redirectTo: redirectUrl);
-  }
-
-  Future<void> updatePassword(String newPassword) async {
-    await _client.auth.updateUser(UserAttributes(password: newPassword));
-  }
-
-  // ---------------------------------------------------------------------------
-  // Sign in with Apple (native Apple SDK -> Supabase ID token)
-  // ---------------------------------------------------------------------------
-
-  /// Returns false if the user cancelled the Apple sheet.
-  Future<bool> signInWithApple() async {
-    if (defaultTargetPlatform != TargetPlatform.iOS &&
-        defaultTargetPlatform != TargetPlatform.macOS) {
-      try {
-        await _client.auth.signInWithOAuth(
-          OAuthProvider.apple,
-          redirectTo: redirectUrl,
-        );
-        return true;
-      } on AuthException catch (e) {
-        if (e.message.contains('not enabled') || e.statusCode == '400') {
-          throw const AuthException(
-            'Apple Sign-In on Android requires an Apple Secret Key (.p8), Key ID, and Service ID configured in Supabase.',
-          );
-        }
-        rethrow;
-      }
-    }
-
-    final rawNonce = _randomNonce();
-    final hashedNonce = sha256.convert(utf8.encode(rawNonce)).toString();
-
     try {
-      final credential = await SignInWithApple.getAppleIDCredential(
-        scopes: [
-          AppleIDAuthorizationScopes.email,
-          AppleIDAuthorizationScopes.fullName,
-        ],
-        nonce: hashedNonce,
-      );
-
-      final idToken = credential.identityToken;
-      if (idToken == null) {
-        throw const AuthException('Apple did not return an identity token.');
-      }
-
-      await _client.auth.signInWithIdToken(
-        provider: OAuthProvider.apple,
-        idToken: idToken,
-        nonce: rawNonce,
-      );
-
-      // Apple only sends the name on the very first sign-in; save it.
-      final given = credential.givenName;
-      final family = credential.familyName;
-      if (given != null || family != null) {
-        await _client.auth.updateUser(UserAttributes(data: {
-          'full_name': [given, family].whereType<String>().join(' '),
-        }));
-      }
-      return true;
-    } on SignInWithAppleAuthorizationException catch (e) {
-      if (e.code == AuthorizationErrorCode.canceled) return false;
-      if (e.code == AuthorizationErrorCode.unknown) {
+      await _client.auth.resetPasswordForEmail(email, redirectTo: redirectUrl);
+    } on AuthException catch (e) {
+      if (e.statusCode == '429' || e.message.contains('rate limit')) {
         throw const AuthException(
-          'Sign in with Apple error 1000: Please rebuild the app with the new entitlements file or sign into Apple ID on this device.',
+          'Too many reset emails requested. Please wait a minute before trying again.',
+        );
+      }
+      if (e.statusCode == '504' ||
+          e.statusCode == '500' ||
+          e.message.toLowerCase().contains('timeout') ||
+          e.message.toLowerCase().contains('upstream')) {
+        throw const AuthException(
+          'Could not send the reset email right now. Please try again in a moment.',
+        );
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> updatePassword(String newPassword) async {
+    try {
+      await _client.auth.updateUser(UserAttributes(password: newPassword));
+    } on AuthException catch (e) {
+      if (e.message.contains('password') &&
+          (e.message.contains('least') || e.message.contains('length'))) {
+        throw AuthException(
+          'Password must be at least $minPasswordLength characters.',
         );
       }
       rethrow;
@@ -166,17 +230,6 @@ class AuthService {
     return text;
   }
 
+  @override
   Future<void> signOut() => _client.auth.signOut();
-
-  // ---------------------------------------------------------------------------
-
-  String _randomNonce([int length = 32]) {
-    const charset =
-        '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-._';
-    final random = Random.secure();
-    return List.generate(
-      length,
-          (_) => charset[random.nextInt(charset.length)],
-    ).join();
-  }
 }
