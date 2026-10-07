@@ -143,6 +143,11 @@ class AuthService {
       return true;
     } on SignInWithAppleAuthorizationException catch (e) {
       if (e.code == AuthorizationErrorCode.canceled) return false;
+      if (e.code == AuthorizationErrorCode.unknown) {
+        throw const AuthException(
+          'Sign in with Apple error 1000: Please rebuild the app with the new entitlements file or sign into Apple ID on this device.',
+        );
+      }
       rethrow;
     }
   }
