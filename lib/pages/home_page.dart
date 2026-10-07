@@ -3,6 +3,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import '../services/auth_service.dart';
+import '../services/posts_service.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -747,13 +748,15 @@ class _CreatePostTabState extends State<_CreatePostTab> {
       _successMessage = null;
     });
 
-    await Future.delayed(const Duration(milliseconds: 800));
+    final success = await PostsService.instance.createPost(text);
 
     if (!mounted) return;
     setState(() {
       _isPosting = false;
       _postController.clear();
-      _successMessage = 'Post published successfully! 🎉';
+      _successMessage = success
+          ? 'Post published & saved to Supabase! 🎉'
+          : 'Post published locally! (Create "posts" table in Supabase to sync live)';
     });
   }
 
